@@ -177,6 +177,11 @@ namespace Kudu.Contracts.Infrastructure
             }
         }
 
+        public static Task FromError(Exception exception)
+        {
+            return FromError<AsyncVoid>(exception);
+        }
+
         private static Task<TResult> FromError<TResult>(Exception exception)
         {
             TaskCompletionSource<TResult> tcs = new TaskCompletionSource<TResult>();
@@ -194,6 +199,219 @@ namespace Kudu.Contracts.Infrastructure
         private static Task<TResult> Canceled<TResult>()
         {
             return CancelCache<TResult>.Canceled;
+        }
+
+        public static Task Catch(this Task task, Func<Exception, Task> continuation, CancellationToken cancellationToken = default(CancellationToken))
+        {
+            return task.CatchImpl(ex => continuation(ex).ToTask<AsyncVoid>(), cancellationToken);
+        }
+
+        private static Task<TResult> CatchImpl<TResult>(this Task task, Func<Exception, Task<TResult>> continuation, CancellationToken cancellationToken)
+        {
+            // Stay on the same thread if we can
+            if (task.IsCanceled || cancellationToken.IsCancellationRequested)
+            {
+                return Canceled<TResult>();
+            }
+            if (task.IsFaulted)
+            {
+                try
+                {
+                    Task<TResult> resultTask = continuation(task.Exception.GetBaseException());
+                    if (resultTask == null)
+                    {
+                        // Not a resource because this is an internal class, and this is a guard clause that's intended
+                        // to be thrown by us to us, never escaping out to end users.
+                        throw new InvalidOperationException("You cannot return null from the TaskHelpersExtensions.Catch continuation. You must return a valid task or throw an exception.");
+                    }
+
+                    return resultTask;
+                }
+                catch (Exception ex)
+                {
+                    return FromError<TResult>(ex);
+                }
+            }
+            if (task.Status == TaskStatus.RanToCompletion)
+            {
+                TaskCompletionSource<TResult> tcs = new TaskCompletionSource<TResult>();
+                tcs.TrySetFromTask(task);
+                return tcs.Task;
+            }
+
+            return task.ContinueWith(innerTask =>
+            {
+                TaskCompletionSource<Task<TResult>> tcs = new TaskCompletionSource<Task<TResult>>();
+
+                if (innerTask.IsFaulted)
+                {
+                    try
+                    {
+                        Task<TResult> resultTask = continuation(innerTask.Exception.GetBaseException());
+                        if (resultTask == null)
+                        {
+                            throw new InvalidOperationException("You cannot return null from the TaskHelpersExtensions.Catch continuation. You must return a valid task or throw an exception.");
+                        }
+
+                        tcs.TrySetResult(resultTask);
+                    }
+                    catch (Exception ex)
+                    {
+                        tcs.TrySetException(ex);
+                    }
+                }
+                else
+                {
+                    tcs.TrySetFromTask(innerTask);
+                }
+
+                return tcs.Task.FastUnwrap();
+            }, cancellationToken).FastUnwrap();
+        }
+
+        public static Task<TResult> ToTask<TResult>(this Task task, CancellationToken cancellationToken = default(CancellationToken), TResult result = default(TResult))
+        {
+            if (task == null)
+            {
+                return null;
+            }
+
+            // Stay on the same thread if we can
+            if (task.IsCanceled || cancellationToken.IsCancellationRequested)
+            {
+                return Canceled<TResult>();
+            }
+            if (task.IsFaulted)
+            {
+                return FromErrors<TResult>(task.Exception.InnerExceptions);
+            }
+            if (task.Status == TaskStatus.RanToCompletion)
+            {
+                return FromResult(result);
+            }
+
+            return task.ContinueWith(innerTask =>
+            {
+                TaskCompletionSource<TResult> tcs = new TaskCompletionSource<TResult>();
+
+                tcs.TrySetFromTask(innerTask, result);
+                return tcs.Task;
+
+            }, TaskContinuationOptions.ExecuteSynchronously).FastUnwrap();
+        }
+
+        public static bool TrySetFromTask<TResult>(this TaskCompletionSource<TResult> tcs, Task source, TResult result)
+        {
+            if (source.Status == TaskStatus.RanToCompletion)
+            {
+                return tcs.TrySetResult(result);
+            }
+
+            return tcs.TrySetFromTask(source);
+        }
+
+        public static bool TrySetFromTask<TResult>(this TaskCompletionSource<TResult> tcs, Task source)
+        {
+            if (source.Status == TaskStatus.Canceled)
+            {
+                return tcs.TrySetCanceled();
+            }
+
+            if (source.Status == TaskStatus.Faulted)
+            {
+                return tcs.TrySetException(source.Exception.InnerExceptions);
+            }
+
+            if (source.Status == TaskStatus.RanToCompletion)
+            {
+                Task<TResult> taskOfResult = source as Task<TResult>;
+                return tcs.TrySetResult(taskOfResult == null ? default(TResult) : taskOfResult.Result);
+            }
+
+            return false;
+        }
+
+        public static bool TrySetFromTask<TResult>(this TaskCompletionSource<Task<TResult>> tcs, Task source)
+        {
+            if (source.Status == TaskStatus.Canceled)
+            {
+                return tcs.TrySetCanceled();
+            }
+
+            if (source.Status == TaskStatus.Faulted)
+            {
+                return tcs.TrySetException(source.Exception.InnerExceptions);
+            }
+
+            if (source.Status == TaskStatus.RanToCompletion)
+            {
+                // Sometimes the source task is Task<Task<TResult>>, and sometimes it's Task<TResult>.
+                // The latter usually happens when we're in the middle of a sync-block postback where
+                // the continuation is a function which returns Task<TResult> rather than just TResult,
+                // but the originating task was itself just Task<TResult>. An example of this can be
+                // found in TaskExtensions.CatchImpl().
+                Task<Task<TResult>> taskOfTaskOfResult = source as Task<Task<TResult>>;
+                if (taskOfTaskOfResult != null)
+                {
+                    return tcs.TrySetResult(taskOfTaskOfResult.Result);
+                }
+
+                Task<TResult> taskOfResult = source as Task<TResult>;
+                if (taskOfResult != null)
+                {
+                    return tcs.TrySetResult(taskOfResult);
+                }
+
+                return tcs.TrySetResult(FromResult(default(TResult)));
+            }
+
+            return false;
+        }
+
+        public static Task Finally(this Task task, Action continuation)
+        {
+            return task.FinallyImpl<AsyncVoid>(continuation);
+        }
+
+        public static Task<TResult> Finally<TResult>(this Task<TResult> task, Action continuation)
+        {
+            return task.FinallyImpl<TResult>(continuation);
+        }
+
+        private static Task<TResult> FinallyImpl<TResult>(this Task task, Action continuation)
+        {
+            // Stay on the same thread if we can
+            if (task.IsCompleted)
+            {
+                TaskCompletionSource<TResult> tcs = new TaskCompletionSource<TResult>();
+                try
+                {
+                    continuation();
+                    tcs.TrySetFromTask(task);
+                }
+                catch (Exception ex)
+                {
+                    tcs.TrySetException(ex);
+                }
+                return tcs.Task;
+            }
+
+            return task.ContinueWith(innerTask =>
+            {
+                TaskCompletionSource<TResult> tcs = new TaskCompletionSource<TResult>();
+
+                try
+                {
+                    continuation();
+                    tcs.TrySetFromTask(innerTask);
+                }
+                catch (Exception ex)
+                {
+                    tcs.SetException(ex);
+                }
+
+                return tcs.Task;
+            }).FastUnwrap();
         }
 
         private struct AsyncVoid { }

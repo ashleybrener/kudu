@@ -1,8 +1,9 @@
 ﻿using System;
 using System.Collections.Generic;
+using System.Diagnostics;
 using System.IO;
-using System.Linq;
 using System.Web;
+using Kudu.Contracts.Dropbox;
 using Kudu.Contracts.Infrastructure;
 using Kudu.Contracts.Settings;
 using Kudu.Contracts.SourceControl;
@@ -11,16 +12,14 @@ using Kudu.Core;
 using Kudu.Core.Deployment;
 using Kudu.Core.Infrastructure;
 using Kudu.Core.SourceControl.Git;
+using Kudu.Services.Dropbox;
+using Newtonsoft.Json;
 using Newtonsoft.Json.Linq;
-using System.Diagnostics;
 
 namespace Kudu.Services.GitServer
 {
     public class FetchHandler : GitServerHttpHandler
     {
-        private const string PrivateKeyFile = "id_rsa";
-        private const string PublicKeyFile = "id_rsa.pub";
-
         private readonly IDeploymentSettingsManager _settings;
         private readonly RepositoryConfiguration _configuration;
         private readonly IEnvironment _environment;
@@ -51,28 +50,13 @@ namespace Kudu.Services.GitServer
         {
             using (_tracer.Step("FetchHandler"))
             {
-                string json = context.Request.Form["payload"];
-
                 context.Response.TrySkipIisCustomErrors = true;
-
-                if (String.IsNullOrEmpty(json))
-                {
-                    _tracer.TraceWarning("Received empty json payload");
-                    context.Response.StatusCode = 400;
-                    context.ApplicationInstance.CompleteRequest();
-                    return;
-                }
-
-                if (_tracer.TraceLevel >= TraceLevel.Verbose)
-                {
-                    TracePayload(json);
-                }
 
                 RepositoryInfo repositoryInfo = null;
 
                 try
                 {
-                    repositoryInfo = GetRepositoryInfo(context.Request, json);
+                    repositoryInfo = GetRepositoryInfo(context.Request);
                 }
                 catch (FormatException ex)
                 {
@@ -142,7 +126,7 @@ namespace Kudu.Services.GitServer
                         _gitServer.SetReceiveInfo(repositoryInfo.OldRef, repositoryInfo.NewRef, targetBranch);
 
                         // Fetch from url
-                        _gitServer.FetchWithoutConflict(repositoryInfo.RepositoryUrl, "external", targetBranch);
+                        repositoryInfo.Fetch(this, targetBranch);
 
                         // Perform the actual deployment
                         _deploymentManager.Deploy(repositoryInfo.Deployer);
@@ -178,8 +162,24 @@ namespace Kudu.Services.GitServer
             _tracer.Trace("payload", attribs);
         }
 
-        private RepositoryInfo GetRepositoryInfo(HttpRequest request, string json)
+        private RepositoryInfo GetRepositoryInfo(HttpRequest request)
         {
+            if (request.UserAgent != null && request.UserAgent.StartsWith(DropboxHandler.Dropbox, StringComparison.OrdinalIgnoreCase))
+            {
+                return DropboxInfo.Parse(request.InputStream);
+            }
+
+            string json = request.Form["payload"];
+            if (String.IsNullOrEmpty(json))
+            {
+                throw new FormatException(Resources.Error_EmptyPayload);
+            }
+
+            if (_tracer.TraceLevel >= TraceLevel.Verbose)
+            {
+                TracePayload(json);
+            }
+
             JObject payload = null;
             try
             {
@@ -293,6 +293,55 @@ namespace Kudu.Services.GitServer
             public string OldRef { get; set; }
             public string NewRef { get; set; }
             public string Deployer { get; set; }
+
+            public virtual void Fetch(FetchHandler handler, string targetBranch)
+            {
+                // Fetch from url
+                handler._gitServer.FetchWithoutConflict(RepositoryUrl, "external", targetBranch);
+            }
+        }
+
+        private class DropboxInfo : RepositoryInfo
+        {
+            public DropboxDeployInfo DeployInfo { get; set; }
+
+            public static DropboxInfo Parse(Stream stream)
+            {
+                DropboxDeployInfo deployInfo = null;
+                using (JsonTextReader reader = new JsonTextReader(new StreamReader(stream)))
+                {
+                    JsonSerializer serializer = new JsonSerializer();
+                    try
+                    {
+                        deployInfo = serializer.Deserialize<DropboxDeployInfo>(reader);
+                    }
+                    catch (Exception ex)
+                    {
+                        throw new FormatException(Resources.Error_UnsupportedFormat, ex);
+                    }
+
+                    if (deployInfo == null)
+                    {
+                        throw new FormatException(Resources.Error_EmptyPayload);
+                    }
+                }
+
+                return new DropboxInfo
+                {
+                    Deployer = DropboxHandler.Dropbox,
+                    NewRef = "dummy",
+                    OldRef = "dummy",
+                    DeployInfo = deployInfo
+                };
+            }
+
+            public override void Fetch(FetchHandler handler, string targetBranch)
+            {
+                var dropbox = new DropboxHandler(handler._tracer, handler._gitServer, handler._settings, handler._environment);
+
+                // Synchronize dropbox file and commit
+                dropbox.Sync(DeployInfo, targetBranch);
+            }
         }
     }
 }

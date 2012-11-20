@@ -136,6 +136,8 @@
     <Compile Include="Deployment\DeploymentController.cs" />
     <Compile Include="Diagnostics\LogStreamHandler.cs" />
     <Compile Include="Diagnostics\LogStreamManager.cs" />
+    <Compile Include="Dropbox\DropboxHandler.cs" />
+    <Compile Include="Dropbox\DropboxProxy.cs" />
     <Compile Include="GitServer\GitServerHttpHandler.cs" />
     <Compile Include="GitServer\UploadPackHandler.cs" />
     <Compile Include="SSHKey\SSHKeyController.cs" />
@@ -173,6 +175,7 @@
     <EmbeddedResource Include="Resources.resx">
       <Generator>ResXFileCodeGenerator</Generator>
       <LastGenOutput>Resources.Designer.cs</LastGenOutput>
+      <SubType>Designer</SubType>
     </EmbeddedResource>
   </ItemGroup>
   <ItemGroup />
